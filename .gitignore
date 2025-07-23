@@ -1,0 +1,12 @@
+# 排除所有文件
+*
+
+# 但包含 Python 文件
+!*.py
+
+# 包含 .gitignore 本身
+!.gitignore
+
+# 包含 README 等文档（可选）
+!README.md
+!*.md
