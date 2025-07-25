@@ -74,9 +74,9 @@ if __name__ == "__main__":
                 H_data = H_data.to(device)
                 print(H_data.shape)
                 U_out, S_out, V_out = model(H_data)
-                #print(U_out.shape)
-                #print(S_out.shape)
-                #print(V_out.shape)
+                print(U_out.shape)
+                print(S_out.shape)
+                print(V_out.shape)
             ###################################################
             U_out_all[samp_idx, ...] = U_out.cpu().numpy()
             S_out_all[samp_idx, ...] = S_out.cpu().numpy()
