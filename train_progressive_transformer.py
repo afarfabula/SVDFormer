@@ -136,7 +136,8 @@ def reconstruction_loss(pred_U, pred_S, pred_V, H_true, num_components=None):
     diff_imag = H_imag - reconstructed_imag
     
     # |a + bi|^2 = a^2 + b^2
-    loss = torch.mean (torch.sqrt(diff_real ** 2 + diff_imag ** 2)/torch.sqrt(H_real ** 2 + H_imag ** 2))
+    #loss = torch.mean (torch.sqrt(diff_real ** 2 + diff_imag ** 2)/torch.sqrt(H_real ** 2 + H_imag ** 2))
+    loss = torch.mean(diff_real ** 2 + diff_imag ** 2)
     return loss
 
 # 渐进式训练函数
@@ -151,7 +152,8 @@ def progressive_training(resume_from=None):
     recon_weight = 1.0
     
     # 每个阶段监督的分量数量
-    stage_components = [2,4, 8, 16, 24,32]
+    #stage_components = [1,4, 8, 16, 32,32]
+    stage_components = [1,1, 1, 1, 1,1]
     iterations = 6
     
     print(f"=== 渐进式训练配置 ===")

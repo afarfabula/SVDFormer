@@ -30,176 +30,157 @@ class SVDTransformer(nn.Module):
         self.use_conv_encoder = use_conv_encoder
         self.use_vit_encoder = use_vit_encoder
 
-        # 1. Input Encoder - 支持线性层、卷积层和ViT三种方式
+        # 1. Input Encoder - 保持共享（因为输入H是固定的）
         if use_vit_encoder:
-            # ViT编码器：将64x64x2的矩阵视为图像，分割成patches
-            self.patch_size = 8  # 8x8的patch，64x64矩阵可分成8x8=64个patches
-            self.num_patches = (input_dim // self.patch_size) ** 2  # 64个patches
-            self.patch_dim = self.patch_size * self.patch_size * 2  # 8*8*2=128
+            # ViT编码器配置保持不变
+            self.patch_size = 8
+            self.num_patches = (input_dim // self.patch_size) ** 2
+            self.patch_dim = self.patch_size * self.patch_size * 2
             
-            # Patch embedding: 将每个patch线性映射到embed_dim
             self.patch_embedding = nn.Linear(self.patch_dim, embed_dim)
-            
-            # 位置编码for patches
             self.patch_pos_embedding = nn.Parameter(torch.randn(1, self.num_patches, embed_dim))
             
-            # ViT Transformer for patch processing
             vit_layer = nn.TransformerEncoderLayer(
                 d_model=embed_dim, 
-                nhead=nhead//2,  # 使用较少的注意力头
+                nhead=nhead//2,
                 dim_feedforward=dim_feedforward//2, 
                 dropout=dropout, 
                 batch_first=True
             )
             self.vit_transformer = nn.TransformerEncoder(vit_layer, num_layers=2)
-            
-            # 将64个patch tokens映射回64个row tokens
             self.patch_to_row = nn.Linear(embed_dim, embed_dim)
             
         elif use_conv_encoder:
-            # 卷积编码器：将64x64x2的矩阵编码为64个token
-            # 使用1D卷积处理每一行，确保输出维度为embed_dim
             self.h_conv_encoder = nn.Sequential(
-                # 输入: (B, 64, 128) - 每行128维(64*2)
                 nn.Conv1d(in_channels=input_dim*2, out_channels=embed_dim*2, kernel_size=3, padding=1),
                 nn.ReLU(),
                 nn.Conv1d(in_channels=embed_dim*2, out_channels=embed_dim, kernel_size=3, padding=1),
                 nn.ReLU(),
-                # 输出: (B, embed_dim, 64)
             )
-            # 注意：卷积后需要转置以匹配(B, 64, embed_dim)
         else:
-            # 原始线性编码器
-            # Encodes each of the 64 rows (64x2) of the input matrix into a token.
             self.h_encoder = nn.Linear(input_dim * 2, embed_dim)
 
-        # 2. SVD component embeddings
-        self.u_embed = nn.Linear(input_dim * 2, embed_dim) # U row is (64, 2) -> 128
-        self.v_embed = nn.Linear(input_dim * 2, embed_dim) # V row is (64, 2) -> 128
-        self.s_embed = nn.Linear(rank, embed_dim) # S vector is (32) -> embed_dim
+        # 2. 为每个阶段创建独立的SVD组件嵌入层
+        self.stage_u_embeds = nn.ModuleList([
+            nn.Linear(input_dim * 2, embed_dim) for _ in range(max_iters)
+        ])
+        self.stage_v_embeds = nn.ModuleList([
+            nn.Linear(input_dim * 2, embed_dim) for _ in range(max_iters)
+        ])
+        self.stage_s_embeds = nn.ModuleList([
+            nn.Linear(rank, embed_dim) for _ in range(max_iters)
+        ])
 
-        # 3. Positional Encoding for iterations - 使用更大的max_len
+        # 3. 为每个阶段创建独立的Transformer编码器
+        self.stage_transformers = nn.ModuleList()
+        for i in range(max_iters):
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=embed_dim, 
+                nhead=nhead, 
+                dim_feedforward=dim_feedforward, 
+                dropout=dropout, 
+                batch_first=True
+            )
+            transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+            self.stage_transformers.append(transformer)
+
+        # 4. 为每个阶段创建独立的解码器
+        self.stage_u_decoders = nn.ModuleList([
+            nn.Linear(embed_dim, input_dim * 2) for _ in range(max_iters)
+        ])
+        self.stage_v_decoders = nn.ModuleList([
+            nn.Linear(embed_dim, input_dim * 2) for _ in range(max_iters)
+        ])
+        self.stage_s_decoders = nn.ModuleList([
+            nn.Linear(embed_dim, rank) for _ in range(max_iters)
+        ])
+
+        # 5. 位置编码（保持共享）
         self.pos_encoder = PositionalEncoding(embed_dim, max_len=max_iters)
 
-        # 4. Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=nhead, 
-                                                 dim_feedforward=dim_feedforward, 
-                                                 dropout=dropout, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
-
-        # 5. Output Decoders
-        self.u_decoder = nn.Linear(embed_dim, input_dim * 2)
-        self.v_decoder = nn.Linear(embed_dim, input_dim * 2)
-        self.s_decoder = nn.Linear(embed_dim, rank)
-
-        # 6. Learnable initial parameters for the first iteration
+        # 6. 初始参数（保持共享）
         self.initial_U = nn.Parameter(torch.randn(1, rank, input_dim, 2))
         self.initial_V = nn.Parameter(torch.randn(1, rank, input_dim, 2))
         self.initial_S = nn.Parameter(torch.randn(1, rank))
 
     def forward(self, x, iterations=4, return_all_stages=False):
-        # x: (B, 64, 64, 2)
         batch_size = x.shape[0]
     
-        # Encode the input matrix H
+        # 编码输入矩阵H（使用共享编码器）
         if self.use_vit_encoder:
-            # ViT编码路径
-            # 将64x64x2矩阵分割成8x8x2的patches
-            # x: (B, 64, 64, 2) -> patches: (B, num_patches, patch_dim)
-            patches = self._extract_patches(x)  # (B, 64, 128)
-            
-            # Patch embedding
-            patch_tokens = self.patch_embedding(patches)  # (B, 64, embed_dim)
-            
-            # 添加位置编码
+            patches = self._extract_patches(x)
+            patch_tokens = self.patch_embedding(patches)
             patch_tokens = patch_tokens + self.patch_pos_embedding
-            
-            # ViT Transformer处理patches
-            vit_output = self.vit_transformer(patch_tokens)  # (B, 64, embed_dim)
-            
-            # 将patch tokens映射为row tokens
-            encoded_h = self.patch_to_row(vit_output)  # (B, 64, embed_dim)
-            
+            vit_output = self.vit_transformer(patch_tokens)
+            encoded_h = self.patch_to_row(vit_output)
         elif self.use_conv_encoder:
-            # 卷积编码路径
-            # Reshape H to treat each of the 64 rows as a sample to be encoded.
-            # x -> (B, 64, 64, 2) -> h_reshaped (B, 64, 128)
             h_reshaped = x.view(batch_size, self.input_dim, self.input_dim * 2)
-            # h_reshaped: (B, 64, 128) -> (B, 128, 64) for conv1d
-            h_transposed = h_reshaped.transpose(1, 2)  # (B, 128, 64)
-            encoded_h_conv = self.h_conv_encoder(h_transposed)  # (B, embed_dim, 64)
-            encoded_h = encoded_h_conv.transpose(1, 2)  # (B, 64, embed_dim)
+            h_transposed = h_reshaped.transpose(1, 2)
+            encoded_h_conv = self.h_conv_encoder(h_transposed)
+            encoded_h = encoded_h_conv.transpose(1, 2)
         else:
-            # 线性编码路径（原始方式）
-            # Reshape H to treat each of the 64 rows as a sample to be encoded.
-            # x -> (B, 64, 64, 2) -> h_reshaped (B, 64, 128)
             h_reshaped = x.view(batch_size, self.input_dim, self.input_dim * 2)
-            encoded_h = self.h_encoder(h_reshaped)  # (B, 64, embed_dim)
+            encoded_h = self.h_encoder(h_reshaped)
     
-        # Initialize SVD components
+        # 初始化SVD分量
         pred_U = self.initial_U.expand(batch_size, -1, -1, -1)
         pred_V = self.initial_V.expand(batch_size, -1, -1, -1)
         pred_S = self.initial_S.expand(batch_size, -1)
     
-        # Store intermediate results if needed
         if return_all_stages:
             all_stages = []
     
-        # Iterative refinement
+        # 迭代细化 - 每个阶段使用独立权重
         for i in range(iterations):
-            # --- Tokenization of current SVD estimates ---
-            # pred_U is (B, 32, 64, 2) -> flatten to (B, 32, 128)
+            # 使用第i阶段的独立嵌入层
             u_flat = pred_U.flatten(start_dim=2)
-            u_tokens = self.u_embed(u_flat) # (B, 32, embed_dim)
+            u_tokens = self.stage_u_embeds[i](u_flat)
     
-            # pred_V is (B, 32, 64, 2) -> flatten to (B, 32, 128)
             v_flat = pred_V.flatten(start_dim=2)
-            v_tokens = self.v_embed(v_flat) # (B, 32, embed_dim)
+            v_tokens = self.stage_v_embeds[i](v_flat)
     
-            # pred_S is (B, 32)
-            s_tokens = self.s_embed(pred_S).unsqueeze(1) # (B, 1, embed_dim)
+            s_tokens = self.stage_s_embeds[i](pred_S).unsqueeze(1)
     
-            # --- Token Concatenation and Transformer Pass ---
-            # Total tokens: 64 (from H) + 32 (from U) + 32 (from V) + 1 (from S) = 129
+            # 拼接tokens
             tokens = torch.cat([encoded_h, u_tokens, v_tokens, s_tokens], dim=1)
     
-            # Add positional encoding for the current iteration
+            # 添加位置编码
             tokens = self.pos_encoder(tokens, i)
     
-            # Pass through transformer
-            output_tokens = self.transformer_encoder(tokens)
+            # 使用第i阶段的独立Transformer
+            output_tokens = self.stage_transformers[i](tokens)
     
-            # --- Decoding and Residual Prediction ---
-            # Split the output tokens back into their respective parts
+            # 分割输出tokens
             h_out_len, u_out_len, v_out_len = self.input_dim, self.rank, self.rank
             u_start, v_start = h_out_len, h_out_len + u_out_len
             
             u_out = output_tokens[:, u_start:v_start, :]
             v_out = output_tokens[:, v_start:v_start + v_out_len, :]
-            s_out = output_tokens[:, -1, :] # Last token is for S
+            s_out = output_tokens[:, -1, :]
     
-            # Decode to get the residual values
-            delta_U_flat = self.u_decoder(u_out) # (B, 32, 128)
+            # 使用第i阶段的独立解码器
+            delta_U_flat = self.stage_u_decoders[i](u_out)
             delta_U = delta_U_flat.view(batch_size, self.rank, self.input_dim, 2)
     
-            delta_V_flat = self.v_decoder(v_out)
+            delta_V_flat = self.stage_v_decoders[i](v_out)
             delta_V = delta_V_flat.view(batch_size, self.rank, self.input_dim, 2)
     
-            delta_S = self.s_decoder(s_out) # (B, rank)
+            delta_S = self.stage_s_decoders[i](s_out)
     
-            # --- Update SVD components ---
+            # 更新SVD分量
             pred_U = pred_U + delta_U
             pred_V = pred_V + delta_V
             pred_S = pred_S + delta_S
             
-
+            # 添加列归一化（可选）
+            pred_U = self.normalize_columns(pred_U)
+            pred_V = self.normalize_columns(pred_V)
     
-            # Store current stage output if needed (all 32 components)
             if return_all_stages:
                 all_stages.append((pred_U.clone(), pred_S.clone(), pred_V.clone()))
     
         if return_all_stages:
-            return all_stages  # List of (U, S, V) tuples for each iteration
+            return all_stages
         else:
             return pred_U, pred_S, pred_V
     def normalize_columns(self, mat):
